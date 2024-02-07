@@ -1,0 +1,1892 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+# Load libraries
+```{r}
+library(tidyverse)
+library(data.table)
+library(ggplot2)
+library(ggsci)
+library(ggrepel)
+library(scales)
+library(grid)
+library(matrixStats)
+```
+
+# Cox regression
+
+```{r}
+allResult <- readRDS("Result/coxReg_clinical.rds")
+allResTable <- NULL
+allEvents <- names(allResult)
+
+for (event in allEvents) {
+  tmp <- allResult[[event]]
+  if (is.null(tmp)) next
+
+  olinkFeatures <- names(tmp)
+  tmpRes <- lapply(olinkFeatures, function(feature) {
+    data.frame(
+      assay = feature,
+      cancer = event,
+      pVal = tmp[[feature]][["coef"]][feature, "Pr(>|z|)"],
+      coef = tmp[[feature]][["coef"]][feature, "coef"],
+      numCase = tmp[[feature]][["numCase"]],
+      numControl = tmp[[feature]][["numControl"]]
+    )
+  }) %>% do.call(what = rbind)
+  allResTable <- rbind(allResTable, tmpRes)
+}
+
+allResTable <- allResTable %>%
+  group_by(cancer) %>%
+  mutate(pFDR = p.adjust(pVal, method = "fdr"), .after = "pVal") %>%
+  ungroup()
+
+allResTable <- allResTable %>%
+  dplyr::filter(cancer == "Myeloid")
+```
+
+## Myeloid volcano (Figure 1A)
+```{r}
+allAssoc <- readRDS("Result/proChAssoc/proChAssoc_indel_or_cnv.rds")
+allAssoc <- data.frame(
+  type = "chAssoc",
+  assay = toupper(names(allAssoc)),
+  pFDR = p.adjust(sapply(allAssoc, function(x) x$pVal), method = "fdr"),
+  coef = sapply(allAssoc, \(x) x$coef[nrow(x$coef), "Estimate"])
+) %>%
+  mutate(
+    minusLogP = -log10(pFDR),
+    coef = scale(coef)
+  )
+
+toPlot <- allResTable %>%
+  dplyr::filter(cancer == "Myeloid") %>%
+  dplyr::mutate(
+    type = "myAssoc",
+    assay = toupper(assay),
+    minusLogP = log10(pFDR)
+  ) %>%
+  dplyr::select(type, assay, pFDR, coef, minusLogP) %>%
+  mutate(coef = scale(coef)) %>%
+  rbind(allAssoc) %>%
+  group_by(assay) %>%
+  mutate(typeSig = paste(type[pFDR <= 0.05], collapse = "|")) %>%
+  ungroup() %>%
+  mutate(
+    typeSig = case_when(
+      typeSig == "myAssoc|chAssoc" ~ "MN & CH",
+      typeSig == "chAssoc" ~ "CH only",
+      typeSig == "myAssoc" ~ "MN only",
+      TRUE ~ "Not significant"
+    ),
+    typeSig = factor(typeSig, levels = c("MN & CH", "MN only", "CH only", "Not significant"))
+  ) %>%
+  dplyr::arrange(desc(as.numeric(typeSig)))
+
+png("Fig/meyloidVolcano.png", width = 8, height = 6, units = "in", res = 300)
+
+sqrtWithNeg <- scales::trans_new("sqrtWithNeg",
+  transform = function(x) sign(x) * sqrt(abs(x)),
+  inverse = function(x) sign(x) * abs(x)**2
+)
+
+labelData <- toPlot %>%
+  arrange(desc(minusLogP))
+labelData <- rbind(
+  labelData %>% slice_head(n = 20),
+  labelData %>% slice_tail(n = 20)
+)
+
+p <- ggplot(toPlot, aes(x = minusLogP, y = coef, color = typeSig)) +
+  geom_point(shape = 19, alpha = 0.8) +
+  theme_classic() +
+  scale_color_manual(values = c("#BC3C29FF", "#0072B5FF", "#20854EFF", "grey")) +
+  coord_cartesian(clip = "off", ylim = c(
+    -max(abs(toPlot$coef)) - 1,
+    max(abs(toPlot$coef)) + 1
+  )) +
+  theme(plot.margin = unit(c(1, 1, 2, 1), "lines")) +
+  scale_x_continuous(trans = sqrtWithNeg, labels = abs, breaks = c(-10, -5, -2, 0, 2, 5, 10)) +
+  geom_label_repel(
+    data = labelData,
+    mapping = aes(x = minusLogP, y = coef, label = assay),
+    max.overlaps = 30,
+    min.segment.length = 0,
+    show.legend = FALSE
+  ) +
+  labs(y = "z-score transformed coefficient", x = expression(-log[10] ~ pFDR), color = "Significant p-FDR") +
+  geom_vline(xintercept = 0, alpha = 0.2) +
+  geom_label(
+    data = data.frame(
+      x = c(-5, 5),
+      y = c(-10, -10),
+      label = c("MN associated proteins", "CH associated proteins"),
+      color = c("MN only", "CH only")
+    ), mapping = aes(x = x, y = y, label = label, color = color),
+    inherit.aes = FALSE, show.legend = FALSE
+  ) +
+  guides(color = guide_legend(ncol = 2)) +
+  theme(
+    legend.position = c(0.2, 0.1),
+    legend.background = element_rect(
+      fill = "white",
+      linewidth = 0.5, linetype = "solid",
+      colour = "black"
+    )
+  )
+
+p
+
+dev.off()
+```
+
+## Heatmap, CH indel ~ proteins significantly associated with myeloid or CH (Supplementary Figure 4)
+```{r}
+allAssoc <- readRDS("Result/proChAssoc/proChAssoc_indel_or_cnv.rds")
+allAssoc <- data.frame(
+  type = "chAssoc",
+  assay = toupper(names(allAssoc)),
+  pFDR = p.adjust(sapply(allAssoc, function(x) x$pVal), method = "fdr"),
+  coef = sapply(allAssoc, \(x) x$coef[nrow(x$coef), 1])
+)
+
+allSigProteomics <- readRDS("Result/coxReg_clinical.rds")$Myeloid
+
+olinkFeatures <- names(allSigProteomics)
+allSigProteomics <- lapply(olinkFeatures, function(feature) {
+  data.frame(
+    assay = feature,
+    pVal = allSigProteomics[[feature]][["coef"]][feature, "Pr(>|z|)"],
+    coef = NA
+  )
+}) %>%
+  do.call(what = rbind) %>%
+  mutate(pFDR = p.adjust(pVal, method = "fdr"))
+
+allSigProteomics <- allSigProteomics %>%
+  dplyr::mutate(
+    type = "myAssoc",
+    assay = toupper(assay)
+  ) %>%
+  dplyr::select(type, assay, pFDR, coef) %>%
+  rbind(allAssoc %>% dplyr::select(type, assay, pFDR, coef)) %>%
+  group_by(assay) %>%
+  mutate(typeSig = paste(type[pFDR <= 0.05], collapse = "|")) %>%
+  ungroup() %>%
+  mutate(
+    typeSig = case_when(
+      typeSig == "myAssoc|chAssoc" ~ "Associated with myeloid and CH",
+      typeSig == "chAssoc" ~ "Associated with CH",
+      typeSig == "myAssoc" ~ "Associated with myeloid",
+      TRUE ~ "Not significant"
+    ),
+    typeSig = factor(typeSig, levels = c("Associated with myeloid and CH", "Associated with myeloid", "Associated with CH", "Not significant"))
+  ) %>%
+  dplyr::arrange(desc(as.numeric(typeSig))) %>%
+  dplyr::filter(type == "chAssoc" & typeSig != "Not significant") %>%
+  mutate(typeSig = typeSig %>% droplevels())
+
+allResult <- readRDS("Result/coxRegCh_clinical.rds")
+allResTable <- NULL
+allEvents <- names(allResult)
+
+for (event in allEvents) {
+  tmp <- allResult[[event]]
+  if (is.null(tmp)) next
+
+  tmpRes <- lapply(names(tmp), function(feature) {
+    data.frame(
+      assay = feature,
+      cancer = event,
+      pVal = tmp[[feature]][["pVal"]]
+    )
+  }) %>%
+    do.call(what = rbind) %>%
+    dplyr::filter(!assay %in% c("indel_or_cnv", "cnv_allCnv", "indel_chPD", "indel_maxVaf"))
+  allResTable <- rbind(allResTable, tmpRes)
+}
+
+allCh <- allResTable %>%
+  group_by(cancer) %>%
+  mutate(pFDR = p.adjust(pVal, method = "fdr"), .after = "pVal") %>%
+  ungroup() %>%
+  split(.$cancer) %>%
+  lapply(\(x) x %>% pull(assay))
+allCh <- allCh$Myeloid %>% grep("indel_", ., value = TRUE)
+
+allAssocTable <- NULL
+for (chFeature in allCh) {
+  if (grepl("indel_", chFeature)) {
+    f <- str_glue("Result/proChAssoc/proChAssoc_{chFeature}_vaf.rds")
+  } else {
+    f <- str_glue("Result/proChAssoc/proChAssoc_{chFeature}_frac.rds")
+  }
+
+  allAssoc <- readRDS(f)
+
+  assocTable <-
+    data.frame(
+      chFeature = chFeature,
+      assay = names(allAssoc),
+      pVal = sapply(allAssoc, \(x) x$pVal),
+      coef = sapply(allAssoc, \(x) x$coef[nrow(x$coef), 1])
+    )
+  allAssocTable <- rbind(allAssocTable, assocTable)
+}
+allAssocTable <- allAssocTable %>%
+  group_by(chFeature) %>%
+  mutate(
+    coef = ifelse(abs(coef) > 0.25, 0.25 * sign(coef), coef),
+    pFDR = p.adjust(pVal, method = "fdr")
+  ) %>%
+  ungroup() %>%
+  mutate(assay = toupper(assay)) %>%
+  dplyr::filter(assay %in% allSigProteomics$assay) %>%
+  arrange(chFeature) %>%
+  mutate(
+    chFeature = gsub("indel_", "", chFeature)
+  ) %>%
+  mutate(
+    chFeature = factor(chFeature, levels = unique(chFeature))
+  )
+
+allAssocTable <- allAssocTable %>% left_join(
+  allSigProteomics %>% dplyr::select(assay, typeSig),
+  by = "assay"
+)
+
+toInclude <- allAssocTable %>%
+  group_by(assay) %>%
+  mutate(noneSig = all(pFDR > 0.05)) %>%
+  dplyr::filter(!noneSig) %>%
+  mutate(zscore = scale(coef)) %>%
+  ungroup() %>%
+  arrange(desc(abs(zscore))) %>%
+  dplyr::filter(abs(zscore) >= 2.5 & pFDR <= 0.05) %>%
+  pull(assay) %>%
+  unique()
+
+allAssocTable <- allAssocTable %>%
+  dplyr::filter(assay %in% toInclude)
+
+png("Fig/assocHmVaf.png", width = 8, height = 10, units = "in", res = 300)
+
+# Change level name for factor typeSig
+levels(allAssocTable$typeSig) <- c(
+  "MN & CH",
+  "MN",
+  "CH",
+  "NS"
+)
+
+breakPoint <- c(-0.25, -0.15, -0.05, 0, 0.05, 0.15, 0.25)
+breakLabel <- as.character(breakPoint)
+breakLabel[1] <- "<= -0.25"
+breakLabel[length(breakLabel)] <- ">= 0.25"
+p <- ggplot(allAssocTable, aes(y = assay, x = chFeature, fill = coef)) +
+  geom_tile() +
+  scale_fill_gradient2(
+    low = "darkblue",
+    mid = "white",
+    high = "darkred",
+    midpoint = 0,
+    na.value = "white",
+    breaks = breakPoint,
+    labels = breakLabel
+  ) +
+  geom_point(
+    data = allAssocTable %>%
+      dplyr::filter(pFDR <= 0.05),
+    shape = 8,
+    colour = "black",
+    show.legend = F
+  ) +
+  scale_size_area(max_size = 2) +
+  # scale_y_discrete(guide = guide_axis(n.dodge = 2)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) + # , size = 6)) +
+  labs(
+    y = "Protein",
+    x = "CH mutaion",
+    fill = "Coefficient"
+  ) +
+  facet_grid(typeSig ~ ., scales = "free_y", space = "free_y")
+p
+
+dev.off()
+```
+
+## Cox regression with and without CH correction (Figure 1B)
+```{r}
+allResTable <- NULL
+for (fName in c("coxReg", "coxRegChCorrection")) {
+  f <- str_glue("Result/{fName}_clinical.rds")
+  allResult <- readRDS(f)
+
+  tmp <- allResult$Myeloid
+
+  olinkFeatures <- names(tmp)
+  tmpRes <- lapply(olinkFeatures, function(feature) {
+    data.frame(
+      assay = feature,
+      pVal = tmp[[feature]][["coef"]][feature, "Pr(>|z|)"],
+      coef = tmp[[feature]][["coef"]][feature, "coef"],
+      coefSe = tmp[[feature]][["coef"]][feature, "se(coef)"],
+      correction = ifelse(grepl("ChCorrection", fName), "Yes", "No")
+    )
+  }) %>% do.call(what = rbind)
+  tmpRes$pFDR <- p.adjust(tmpRes$pVal, method = "fdr")
+  tmpRes$coefCiLow <- tmpRes$coef - 1.96 * tmpRes$coefSe
+  tmpRes$coefCiHigh <- tmpRes$coef + 1.96 * tmpRes$coefSe
+  allResTable <- rbind(allResTable, tmpRes)
+}
+
+allResTable <- allResTable %>%
+  dplyr::filter(assay %in% !!(allResTable %>%
+    dplyr::filter(correction == "No") %>%
+    arrange(pFDR) %>% slice_head(n = 25) %>% pull(assay)))
+
+allResTable <- allResTable %>%
+  group_by(assay) %>%
+  mutate(hrChange = exp(coef[correction == "No"]) / exp(coef[correction == "Yes"])) %>%
+  mutate(myCoef = coef[correction == "No"]) %>%
+  ungroup() %>%
+  arrange(desc(exp(myCoef))) %>%
+  mutate(
+    assay = toupper(assay),
+    assay = factor(assay, levels = unique(assay)),
+    correction = factor(correction, levels = c("Yes", "No") %>% rev())
+  )
+
+topFeature <- allResTable$assay %>%
+  tolower() %>%
+  unique()
+```
+
+```{r}
+tmp <- data.frame(
+  xmin = 0.15,
+  xmax = 25,
+  ymin = seq(1, nrow(allResTable) / 2 - 1, 2) + 1 - 0.5,
+  ymax = seq(1, nrow(allResTable) / 2 - 1, 2) + 1 + 0.5
+)
+
+png("Fig/coxChCorrection.png", width = 5, height = 5, units = "in", res = 300)
+
+ggplot(data = allResTable, aes(y = assay, x = exp(coef), xmin = exp(coefCiLow), xmax = exp(coefCiHigh), group = correction, color = correction)) +
+  geom_point(size = 1.25, position = position_dodge2(width = 0.9, reverse = TRUE)) +
+  geom_errorbarh(height = .9, position = position_dodge2(padding = 0.5, reverse = TRUE)) +
+  labs(x = "Hazard ratio (95% CI)", y = "Protein") +
+  geom_vline(xintercept = 1, color = "black", linetype = "dashed", alpha = .5) +
+  theme_classic() +
+  scale_color_npg(guide = guide_legend(reverse = FALSE, title = "CH correction")) +
+  scale_y_discrete(limits = rev) +
+  scale_x_log10() +
+  coord_cartesian(expand = FALSE) +
+  geom_hline(yintercept = 1:(nrow(allResTable) / 2 - 1) + 0.5, color = "black", linetype = "dashed", alpha = .1) +
+  geom_rect(
+    data = tmp, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+    inherit.aes = FALSE, show.legend = FALSE, alpha = 0.1
+  ) +
+  theme(
+    legend.position = c(0.8, 0.2),
+    legend.background = element_rect(
+      fill = "white",
+      linewidth = 0.5, linetype = "solid",
+      colour = "black"
+    )
+  )
+
+dev.off()
+```
+
+## All cancer hazard ratio of top proteins (Supplementary Figure 2)
+```{r}
+allResTable <- NULL
+
+f <- str_glue("Result/coxReg_clinical.rds")
+allResult <- readRDS(f)
+
+for (event in names(allResult)) {
+  tmp <- allResult[[event]]
+  olinkFeatures <- names(tmp)
+  tmpRes <- lapply(olinkFeatures, function(feature) {
+    data.frame(
+      assay = feature,
+      cancer = event,
+      pVal = tmp[[feature]][["coef"]][feature, "Pr(>|z|)"],
+      coef = tmp[[feature]][["coef"]][feature, "coef"],
+      coefSe = tmp[[feature]][["coef"]][feature, "se(coef)"]
+    )
+  }) %>% do.call(what = rbind)
+  tmpRes$pFDR <- p.adjust(tmpRes$pVal, method = "fdr")
+  tmpRes$coefCiLow <- tmpRes$coef - 1.96 * tmpRes$coefSe
+  tmpRes$coefCiHigh <- tmpRes$coef + 1.96 * tmpRes$coefSe
+  allResTable <- rbind(allResTable, tmpRes)
+}
+
+allResTable <- allResTable %>%
+  dplyr::filter(assay %in% !!(allResTable %>%
+    dplyr::filter(cancer == "Myeloid") %>%
+    arrange(pFDR) %>% slice_head(n = 25) %>% pull(assay)))
+
+allResTable <- allResTable %>%
+  group_by(assay) %>%
+  mutate(myCoef = coef[cancer == "Myeloid"]) %>%
+  ungroup() %>%
+  arrange(desc(exp(myCoef))) %>%
+  dplyr::select(-myCoef) %>%
+  mutate(
+    assay = toupper(assay),
+    assay = factor(assay, levels = unique(assay)),
+    cancer = factor(cancer,
+      levels = c("Myeloid", "MPN_all", "MDS_AML_all"),
+      labels = c("Myeloid", "MPN", "MDS/AML")
+    )
+  )
+
+heterogeneityCancer <- readRDS("Result/heterogeneityCancer.rds")
+names(heterogeneityCancer) <- toupper(names(heterogeneityCancer))
+heterogeneityCancer <- heterogeneityCancer[names(heterogeneityCancer) %in% allResTable$assay]
+heterogeneityCancer <- data.frame(
+  assay = names(heterogeneityCancer),
+  pValHet = sapply(heterogeneityCancer, \(x) x$pVal)
+)
+
+allResTable <- allResTable %>%
+  left_join(heterogeneityCancer, by = "assay") %>%
+  mutate(assay = factor(assay, levels = unique(assay)))
+proteomicsMarkersUnadjusted <- allResTable$assay %>%
+  levels()
+```
+
+```{r}
+png("Fig/coxAllCancer.png", width = 5, height = 5, units = "in", res = 300)
+
+sqrtWithNeg <- scales::trans_new("sqrtWithNeg",
+  transform = function(x) sign(x) * sqrt(abs(x)),
+  inverse = function(x) sign(x) * abs(x)**2
+)
+
+tmp <- data.frame(
+  xmin = 0.05,
+  xmax = 90,
+  ymin = seq(1, nrow(allResTable) / 3 - 1, 2) + 1 - 0.5,
+  ymax = seq(1, nrow(allResTable) / 3 - 1, 2) + 1 + 0.5
+)
+
+pData <- allResTable %>%
+  dplyr::select(assay, pValHet) %>%
+  distinct() %>%
+  mutate(color = ifelse(pValHet < 0.05, "red", "black")) %>%
+  mutate(pValHet = ifelse(pValHet >= 0.01, as.character(round(pValHet, 2)), scientific(pValHet, digits = 1)))
+
+ggplot(data = allResTable, aes(y = assay, x = exp(coef), xmin = exp(coefCiLow), xmax = exp(coefCiHigh), group = cancer, color = cancer)) +
+  geom_point(size = 1.25, position = position_dodge2(width = 0.9, reverse = TRUE)) +
+  geom_errorbarh(height = .9, position = position_dodge2(padding = 0.4, reverse = TRUE)) +
+  labs(x = "Hazard ratio (95% CI)", y = "Protein") +
+  geom_vline(xintercept = 1, color = "black", linetype = "dashed", alpha = .5) +
+  theme_classic() +
+  scale_color_npg(guide = guide_legend(reverse = FALSE, title = "Cancer")) +
+  scale_y_discrete(limits = rev) +
+  scale_x_log10() +
+  coord_cartesian(ylim = c(0.5, nrow(allResTable) / 3), expand = FALSE, clip = "off") +
+  geom_hline(yintercept = 1:(nrow(allResTable) / 3 - 1) + 0.5, color = "black", linetype = "dashed", alpha = .1) +
+  geom_rect(
+    data = tmp, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+    inherit.aes = FALSE, show.legend = FALSE, alpha = 0.1
+  ) +
+  geom_text(
+    data = pData, aes(x = 0.06, y = assay, label = pValHet),
+    color = pData$color,
+    hjust = 0, inherit.aes = FALSE, show.legend = FALSE
+  ) +
+  geom_label(
+    data = data.frame(
+      x = 0.1,
+      y = nrow(allResTable) / 3 + 1.5,
+      label = c("p-Heterogeneity")
+    ), mapping = aes(x = x, y = y, label = label),
+    inherit.aes = FALSE, show.legend = FALSE
+  ) +
+  theme(
+    plot.margin = unit(c(2, 0.5, 0.5, 0.5), "lines"),
+    legend.position = c(0.82, 0.2),
+    legend.background = element_rect(
+      fill = "white",
+      linewidth = 0.5, linetype = "solid",
+      colour = "black"
+    )
+  )
+
+dev.off()
+```
+
+## Circular Heatmap MN, CH (Supplementary Figure 1)
+```{r}
+allAssocCh <- readRDS(str_glue("Result/proChAssoc/proChAssoc_indel_or_cnv.rds"))
+allAssocChTable <- data.frame(
+  association = "chAssoc",
+  assay = names(allAssocCh) %>% toupper(),
+  pVal = sapply(allAssocCh, function(x) x$pVal),
+  pFDR = p.adjust(sapply(allAssocCh, function(x) x$pVal), method = "fdr"),
+  coef = sapply(allAssocCh, function(x) x$coef[nrow(x$coef), 1]) %>% scale()
+)
+
+allAssocMy <- readRDS("Result/coxReg_clinical.rds")$Myeloid
+allAssocMyTable <- lapply(names(allAssocMy), function(feature) {
+  data.frame(
+    association = "myAssoc",
+    assay = feature %>% toupper(),
+    pVal = allAssocMy[[feature]][["coef"]][feature, "Pr(>|z|)"],
+    coef = allAssocMy[[feature]][["coef"]][feature, "coef"]
+  )
+}) %>%
+  do.call(what = rbind) %>%
+  mutate(pFDR = p.adjust(pVal, method = "fdr"), .after = "pVal") %>%
+  mutate(coef = coef %>% scale())
+chAssoc <- allAssocChTable %>%
+  dplyr::filter(pFDR <= 0.05) %>%
+  dplyr::select(assay) %>%
+  pull()
+myAssoc <- allAssocMyTable %>%
+  dplyr::filter(pFDR <= 0.05) %>%
+  dplyr::select(assay) %>%
+  pull()
+chOrMyAssoc <- union(chAssoc, myAssoc)
+chAndMyAssoc <- intersect(chAssoc, myAssoc)
+
+allAssocTable <- rbind(allAssocChTable, allAssocMyTable) %>%
+  dplyr::filter(assay %in% chOrMyAssoc)
+
+allAssocTable$association <- factor(allAssocTable$association, levels = c("chAssoc", "myAssoc"), labels = c("CH", "MN"))
+allAssocTable <- allAssocTable %>%
+  group_by(assay) %>%
+  mutate(
+    associationType = case_when(
+      pFDR[association == "CH"] <= 0.05 & pFDR[association == "MN"] <= 0.05 ~ 1,
+      pFDR[association == "MN"] <= 0.05 ~ 2,
+      pFDR[association == "CH"] <= 0.05 ~ 3,
+      TRUE ~ 4
+    ),
+    dirrection = case_when(
+      coef[association == "CH"] > 0 & coef[association == "MN"] > 0 ~ 1,
+      coef[association == "CH"] < 0 & coef[association == "MN"] < 0 ~ 2,
+      coef[association == "CH"] < 0 & coef[association == "MN"] > 0 ~ 3,
+      coef[association == "CH"] > 0 & coef[association == "MN"] < 0 ~ 4
+    ),
+    myCoef = coef[association == "MN"]
+  ) %>%
+  arrange(desc(myCoef)) %>%
+  arrange(associationType, dirrection) %>%
+  ungroup() %>%
+  mutate(
+    assay = factor(assay, levels = unique(assay))
+  )
+```
+
+```{r}
+heatmap <- ggplot(
+  allAssocTable,
+  aes(x = assay, y = association, fill = coef)
+) +
+  geom_tile(color = "lightgrey") +
+  scale_fill_gradient2(
+    low = "darkblue",
+    mid = "white",
+    high = "darkred",
+    midpoint = 0,
+    na.value = "white"
+  ) +
+  geom_point(
+    aes(size = ifelse(pFDR < 0.05, 1, NA)),
+    shape = 8,
+    colour = "black",
+    show.legend = FALSE
+  ) +
+  scale_size_area(max_size = 1) +
+  labs(x = NULL, y = NULL, fill = "z-transformed\ncoefficient") +
+  # panel_theme +
+  theme_classic() +
+  theme(
+    axis.line = element_blank(),
+    legend.position = "right",
+    plot.margin = margin(0, 0, 0, 300, "pt")
+  )
+
+addScale <- (length(unique(allAssocTable$assay)) + 0.5) / 10
+yExpand <- 4
+yMax <- length(unique(allAssocTable$association)) + 0.5
+p <- heatmap +
+  scale_y_discrete(
+    expand = expansion(add = c(yExpand, 0)),
+    breaks = c("MN", "CH")
+  ) +
+  scale_x_discrete(expand = expansion(add = c(0, addScale)), guide = guide_axis(check.overlap = TRUE)) +
+  coord_polar(start = 0, direction = 1) +
+  theme(
+    legend.position = c(0.9, 0.07),
+    axis.text.x = element_blank(),
+    axis.text.y = element_text(
+      size = 12,
+      face = "bold",
+      hjust = 0.5,
+      angle = -90,
+      margin = margin(0, -11.2, 0, 0, "cm")
+    ),
+    axis.ticks.y = element_blank()
+  ) +
+  guides(fill = guide_colorbar(
+    title.position = "right",
+    title.theme = element_text(angle = -90, hjust = 0, vjust = 1),
+    label.theme = element_text(angle = -90, hjust = 0.5, vjust = 0.5),
+    direction = "horizontal"
+  ))
+maxScale <- length(unique(allAssocTable$assay)) + addScale
+
+p <- p + ggtext::geom_richtext(
+  x = maxScale - 1.5, y = -1, label = "Association",
+  hjust = 1, vjust = 1, angle = -90, inherit.aes = FALSE
+)
+
+toPlot <- as.character(unique(allAssocTable$assay))
+lab1 <- NULL
+for (i in seq(1, length(toPlot))) {
+  angle <- -90 - (i - 0.5) / length(toPlot) * 360 * (maxScale - addScale + 0.5) / maxScale
+  if (angle > -180 | angle < -360) {
+    lab1 <- rbind(lab1, data.frame(
+      x = i + 0.5, y = yMax,
+      label = toPlot[i], angle = angle,
+      hjust = 1, vjust = 1
+    ))
+  } else {
+    angle <- angle + 180
+    lab1 <- rbind(lab1, data.frame(
+      x = i + 0.5, y = yMax,
+      label = toPlot[i], angle = angle,
+      hjust = 0, vjust = 0
+    ))
+  }
+}
+
+p <- p + ggtext::geom_richtext(
+  data = lab1, aes(
+    x = x, y = y, label = label, angle = angle,
+    hjust = hjust, vjust = vjust
+  ),
+  size = 2, label.colour = NA,
+  text.colour = "black", fill = NA,
+  inherit.aes = FALSE
+)
+
+png("Fig/myChAssocCirHeatmap.png", width = 9, height = 9, units = "in", res = 300)
+print(p, vp = viewport(angle = 90))
+dev.off()
+```
+
+## Circular Heatmap MN subtypes (Supplementary Figure 3)
+```{r}
+allAssocTable <- NULL
+
+allAssoc <- readRDS("Result/coxReg_clinical.rds")
+
+for (mnSubtype in names(allAssoc)) {
+  allAssocMy <- allAssoc[[mnSubtype]]
+  allAssocMyTable <- lapply(names(allAssocMy), function(feature) {
+    data.frame(
+      association = mnSubtype,
+      assay = feature %>% toupper(),
+      pVal = allAssocMy[[feature]][["coef"]][feature, "Pr(>|z|)"],
+      coef = allAssocMy[[feature]][["coef"]][feature, "coef"]
+    )
+  }) %>%
+    do.call(what = rbind) %>%
+    mutate(pFDR = p.adjust(pVal, method = "fdr"), .after = "pVal")
+
+  allAssocTable <- rbind(allAssocTable, allAssocMyTable)
+}
+anyAssoc <- allAssocTable %>%
+  dplyr::filter(pFDR <= 0.05) %>%
+  dplyr::select(assay) %>%
+  pull() %>%
+  unique()
+
+allAssocTable <- allAssocTable %>%
+  dplyr::filter(assay %in% anyAssoc)
+
+allAssocTable$association <- factor(allAssocTable$association, levels = c("MDS_AML_all", "MPN_all", "Myeloid"), labels = c("MDS/AML", "MPN", "MN"))
+allAssocTable <- allAssocTable %>%
+  group_by(assay) %>%
+  mutate(
+    associationType = case_when(
+      all(pFDR <= 0.05) ~ 1,
+      pFDR[association == "MN"] <= 0.05 & pFDR[association == "MPN"] <= 0.05 ~ 2,
+      pFDR[association == "MN"] <= 0.05 & pFDR[association == "MDS/AML"] <= 0.05 ~ 3,
+      pFDR[association == "MPN"] <= 0.05 & pFDR[association == "MDS/AML"] <= 0.05 ~ 4,
+      pFDR[association == "MN"] <= 0.05 ~ 5,
+      pFDR[association == "MPN"] <= 0.05 ~ 6,
+      pFDR[association == "MDS/AML"] <= 0.05 ~ 7,
+      TRUE ~ 8
+    ),
+    myCoef = coef[association == "MN"]
+  ) %>%
+  arrange(desc(myCoef)) %>%
+  arrange(associationType) %>%
+  ungroup() %>%
+  mutate(
+    assay = factor(assay, levels = unique(assay))
+  )
+```
+
+```{r}
+heatmap <- ggplot(
+  allAssocTable,
+  aes(x = assay, y = association, fill = coef)
+) +
+  geom_tile(color = "lightgrey") +
+  scale_fill_gradient2(
+    low = "darkblue",
+    mid = "white",
+    high = "darkred",
+    midpoint = 0,
+    na.value = "white"
+  ) +
+  geom_point(
+    aes(size = ifelse(pFDR < 0.05, 1, NA)),
+    shape = 8,
+    colour = "black",
+    show.legend = FALSE
+  ) +
+  scale_size_area(max_size = 1) +
+  labs(x = NULL, y = NULL, fill = "Coefficient") +
+  # panel_theme +
+  theme_classic() +
+  theme(
+    axis.line = element_blank(),
+    legend.position = "right",
+    plot.margin = margin(0, 0, 0, 300, "pt")
+  )
+
+addScale <- (length(unique(allAssocTable$assay)) + 0.5) / 10
+yExpand <- 3
+yMax <- length(unique(allAssocTable$association)) + 0.5
+p <- heatmap +
+  scale_y_discrete(
+    expand = expansion(add = c(yExpand, 0))
+  ) +
+  scale_x_discrete(expand = expansion(add = c(0, addScale)), guide = guide_axis(check.overlap = TRUE)) +
+  coord_polar(start = 0, direction = 1) +
+  theme(
+    legend.position = c(0.9, 0.07),
+    axis.text.x = element_blank(),
+    axis.text.y = element_text(
+      size = 10,
+      face = "bold",
+      hjust = 0.5,
+      angle = -90,
+      margin = margin(0, -11.2, 0, 0, "cm")
+    ),
+    axis.ticks.y = element_blank()
+  ) +
+  guides(fill = guide_colorbar(
+    title.position = "right",
+    title.theme = element_text(angle = -90, hjust = 0, vjust = 1),
+    label.theme = element_text(angle = -90, hjust = 0.5, vjust = 0.5),
+    direction = "horizontal"
+  ))
+maxScale <- length(unique(allAssocTable$assay)) + addScale
+
+p <- p + ggtext::geom_richtext(
+  x = maxScale - 1.5, y = -1.2, label = "Association",
+  hjust = 1, vjust = 1, angle = -90, inherit.aes = FALSE
+)
+
+toPlot <- as.character(unique(allAssocTable$assay))
+lab1 <- NULL
+for (i in seq(1, length(toPlot))) {
+  angle <- -90 - (i - 0.5) / length(toPlot) * 360 * (maxScale - addScale + 0.5) / maxScale
+  if (angle > -180 | angle < -360) {
+    lab1 <- rbind(lab1, data.frame(
+      x = i + 0.5, y = yMax,
+      label = toPlot[i], angle = angle,
+      hjust = 1, vjust = 1
+    ))
+  } else {
+    angle <- angle + 180
+    lab1 <- rbind(lab1, data.frame(
+      x = i + 0.5, y = yMax,
+      label = toPlot[i], angle = angle,
+      hjust = 0, vjust = 0
+    ))
+  }
+}
+
+p <- p + ggtext::geom_richtext(
+  data = lab1, aes(
+    x = x, y = y, label = label, angle = angle,
+    hjust = hjust, vjust = vjust
+  ),
+  size = 2, label.colour = NA,
+  text.colour = "black", fill = NA,
+  inherit.aes = FALSE
+)
+
+png("Fig/mnSubtypeCirHeatmap.png", width = 9, height = 9, units = "in", res = 300)
+print(p, vp = viewport(angle = 90))
+dev.off()
+```
+
+# Cox regression using different feature sets
+```{r}
+featureSetList <- c("clinical", "cliCh", "cliPro", "cliProCh", "cli10ProCh", "cli25ProCh")
+
+allResult <- list()
+for (featureSet in featureSetList) {
+  f <- str_glue("Result/coxRegAll_{featureSet}.rds")
+  allResult[[featureSet]] <- readRDS(f)
+}
+
+aucResult <- NULL
+for (featureSet in featureSetList) {
+  print(featureSet)
+  print(sapply(allResult[[featureSet]]$Myeloid, \(x) x$modRF$AUC) %>% rowMeans(na.rm = TRUE))
+  aucResult <- rbind(
+    aucResult,
+    data.frame(
+      featureSet = featureSet,
+      AUC = sapply(allResult[[featureSet]]$Myeloid, \(x) x$modRF$AUC) %>% rowMeans(na.rm = TRUE) %>% `[`(2)
+    )
+  )
+}
+rownames(aucResult) <- NULL
+```
+
+## AUC (Figure 1C)
+```{r}
+ci <- function(df) {
+  n <- ncol(df)
+  xbar <- rowMeans(df)
+  xsd <- rowSds(df)
+  margin <- qt(0.975, df = n - 1) * xsd / sqrt(n)
+  res <- cbind(xbar, xbar - margin, xbar + margin)
+  colnames(res) <- c("mean", "ciLow", "ciUp")
+  res
+}
+
+featureSetList <- c("clinical", "cliCh", "cliPro", "cliProCh")
+
+allResult <- list()
+for (featureSet in featureSetList) {
+  f <- str_glue("Result/coxRegAll_{featureSet}.rds")
+  allResult[[featureSet]] <- readRDS(f)$Myeloid
+}
+
+toPlot <- NULL
+for (featureSet in featureSetList) {
+  tp <- sapply(allResult[[featureSet]], \(x) x$modRF$TP[, 2])
+  tp <- ci(tp) %>% as.data.frame()
+  colnames(tp) <- paste0("tp_", colnames(tp))
+  fp <- sapply(allResult[[featureSet]], \(x) x$modRF$FP[, 2])
+  fp <- ci(fp) %>% as.data.frame()
+  colnames(fp) <- paste0("fp_", colnames(fp))
+  tmp <- cbind(tp, fp)
+  tmp$featureSet <- featureSet
+  toPlot <- rbind(toPlot, tmp)
+}
+toPlot$featureSet <- factor(toPlot$featureSet,
+  levels = featureSetList,
+  labels = paste0(
+    c("Clinical", "Clinical + CH", "Clinical + Proteomics", "Clinical + Proteomics + CH"),
+    " (AUC=",
+    aucResult$AUC[match(featureSetList, aucResult$featureSet)] %>%
+      round(2),
+    ")"
+  )
+)
+
+png("Fig/auc.png", width = 5, height = 5, units = "in", res = 300)
+
+p <- ggplot(toPlot, aes(
+  x = fp_mean, y = tp_mean, group = featureSet,
+  color = featureSet
+)) +
+  theme_classic() +
+  scale_color_npg() +
+  geom_line() +
+  geom_ribbon(aes(
+    x = fp_mean, y = tp_mean,
+    group = featureSet, fill = featureSet,
+    ymin = tp_ciLow, ymax = tp_ciUp
+  ), alpha = 0.2, inherit.aes = FALSE) +
+  labs(
+    x = "1 - Specificity",
+    y = "Sentisivity",
+    color = "",
+    fill = ""
+  ) +
+  theme(legend.position = c(0.7, 0.2))
+
+p
+
+dev.off()
+```
+
+## AUC top proteins (Supplementary Figure 8)
+```{r}
+ci <- function(df) {
+  n <- ncol(df)
+  xbar <- rowMeans(df)
+  xsd <- rowSds(df)
+  margin <- qt(0.975, df = n - 1) * xsd / sqrt(n)
+  res <- cbind(xbar, xbar - margin, xbar + margin)
+  colnames(res) <- c("mean", "ciLow", "ciUp")
+  res
+}
+
+featureSetList <- c("cliProCh", "cli10ProCh", "cli25ProCh")
+
+allResult <- list()
+for (featureSet in featureSetList) {
+  f <- str_glue("Result/coxRegAll_{featureSet}.rds")
+  allResult[[featureSet]] <- readRDS(f)$Myeloid
+}
+
+toPlot <- NULL
+for (featureSet in featureSetList) {
+  tp <- sapply(allResult[[featureSet]], \(x) x$modRF$TP[, 2])
+  tp <- ci(tp) %>% as.data.frame()
+  colnames(tp) <- paste0("tp_", colnames(tp))
+  fp <- sapply(allResult[[featureSet]], \(x) x$modRF$FP[, 2])
+  fp <- ci(fp) %>% as.data.frame()
+  colnames(fp) <- paste0("fp_", colnames(fp))
+  tmp <- cbind(tp, fp)
+  tmp$featureSet <- featureSet
+  toPlot <- rbind(toPlot, tmp)
+}
+toPlot$featureSet <- factor(toPlot$featureSet,
+  levels = featureSetList,
+  labels = paste0(
+    c("Clinical + Proteomics + CH", "Clinical + Proteomics (Top 10) + CH", "Clinical + Proteomics (Top 25) + CH"),
+    " (AUC=",
+    aucResult$AUC[match(featureSetList, aucResult$featureSet)] %>%
+      round(2),
+    ")"
+  )
+)
+
+p <- ggplot(toPlot, aes(
+  x = fp_mean, y = tp_mean, group = featureSet,
+  color = featureSet
+)) +
+  theme_classic() +
+  scale_color_npg() +
+  geom_line() +
+  geom_ribbon(aes(
+    x = fp_mean, y = tp_mean,
+    group = featureSet, fill = featureSet,
+    ymin = tp_ciLow, ymax = tp_ciUp
+  ), alpha = 0.2, inherit.aes = FALSE) +
+  labs(
+    x = "1 - Specificity",
+    y = "Sentisivity",
+    color = "",
+    fill = ""
+  ) +
+  theme(legend.position = c(0.6, 0.2))
+
+png("Fig/aucTopPro.png", width = 5, height = 5, units = "in", res = 300)
+p
+dev.off()
+```
+
+## Top features frequency and coefficient (Supplementary Figure 7)
+```{r}
+coxRegAll_cliProCh <- readRDS("Result/coxRegAll_cliProCh.rds")
+
+allCoef <- lapply(
+  coxRegAll_cliProCh$Myeloid,
+  function(x) {
+    as.matrix(x$coef) %>%
+      as.data.frame() %>%
+      round(3)
+  }
+) %>%
+  do.call(what = cbind)
+
+toPlot <- data.frame(
+  feature = row.names(allCoef),
+  selected = rowSums(allCoef != 0),
+  coef = rowMeans(allCoef),
+  se = matrixStats::rowSds(allCoef %>% as.matrix()) / sqrt(ncol(allCoef))
+)
+toPlot$ciLow <- toPlot$coef - 1.96 * toPlot$se
+toPlot$ciHigh <- toPlot$coef + 1.96 * toPlot$se
+
+processFeature <- function(feature) {
+  feature <- case_when(
+    feature == "indel_maxVaf" ~ "SNV/indel max VAF",
+    feature == "sex" ~ "Sex",
+    grepl("age", feature) ~ "Age",
+    grepl("indel_", feature) ~ gsub("indel_", "SNV/indel ", feature),
+    grepl("cnv_", feature) ~ gsub("cnv_", "mCA ", feature),
+    grepl("smk", feature) ~ gsub("smk", "", feature),
+    grepl("yrs", feature) ~ gsub("yrs", "Year ", feature),
+    grepl("_", feature) ~ gsub("_", " ", feature) %>% str_to_sentence(),
+    TRUE ~ feature %>% str_to_upper()
+  )
+  feature
+}
+
+toPlot <- toPlot %>%
+  mutate(
+    feature = processFeature(feature)
+  )
+
+toPlot <- toPlot %>%
+  arrange(desc(selected)) %>%
+  slice_head(n = 25) %>%
+  mutate(feature = factor(feature, levels = feature))
+
+timeSelected <- rowSums(allCoef != 0) %>%
+  sort(decreasing = TRUE) %>%
+  as.data.frame() %>%
+  rownames_to_column("feature")
+colnames(timeSelected) <- c("feature", "freq")
+timeSelected <- timeSelected %>%
+  mutate(
+    feature = processFeature(feature)
+  ) %>%
+  dplyr::filter(feature %in% as.character(toPlot$feature)) %>%
+  arrange(desc(freq)) %>%
+  mutate(feature = factor(feature, levels = as.character(toPlot$feature)))
+
+png("Fig/topFeature.png", width = 10, height = 6, units = "in", res = 300)
+
+p1 <- ggplot(data = timeSelected, aes(y = feature, x = freq)) +
+  geom_bar(stat = "identity") +
+  scale_y_discrete(limits = rev) +
+  coord_cartesian(xlim = c(50, 100)) +
+  labs(x = "Frequency", y = "Feature") +
+  theme_classic()
+
+p2 <- ggplot(data = toPlot, aes(y = feature, x = coef, xmin = ciLow, xmax = ciHigh)) +
+  geom_point(position = position_dodge(width = 0.9)) +
+  geom_errorbarh(height = .1, position = position_dodge(width = 0.9)) +
+  labs(x = "Coefficient", y = "Feature") +
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed", alpha = .5) +
+  theme_classic() +
+  scale_y_discrete(limits = rev) +
+  geom_hline(yintercept = 1:(nrow(toPlot) / 1 - 1) + 0.5, color = "black", linetype = "dashed", alpha = .1)
+
+cowplot::plot_grid(plotlist = list(p1, p2), nrow = 1, rel_widths = c(1, 2))
+
+dev.off()
+```
+
+## AUC for CHRS (Supplementary Figure 9)
+```{r}
+ci <- function(df) {
+  n <- ncol(df)
+  xbar <- rowMeans(df)
+  xsd <- rowSds(df)
+  margin <- qt(0.975, df = n - 1) * xsd / sqrt(n)
+  res <- cbind(xbar, xbar - margin, xbar + margin)
+  colnames(res) <- c("mean", "ciLow", "ciUp")
+  res
+}
+
+extendAuc <- function(df, nBin = 500) {
+  if (nrow(df) >= nBin) {
+    df
+  } else {
+    res <- data.frame(
+      matrix(NA, nrow = nBin, ncol = ncol(df))
+    )
+    colnames(res) <- colnames(df)
+    for (i in 1:ncol(df)) {
+      if (all(is.na(df[, i]))) {
+        next
+      }
+      res[, i] <- approx(df[, i], n = nBin)$y
+    }
+    res
+  }
+}
+
+allFiles <- list.files("Result/chrs/", pattern = "coxRegChrs_.*.rds", full.names = TRUE)
+
+allResult <- list()
+aucResult <- NULL
+for (f in allFiles) {
+  featureSet <- str_extract(f, "(?<=coxRegChrs_).*(?=_)")
+  dataSubset <- str_extract(f, "(?<=_).*(?=\\.rds)") %>%
+    str_split("_", simplify = TRUE) %>%
+    `[`(1, 2)
+
+  featureDataSet <- paste0(featureSet, "_", dataSubset)
+
+  tmp <- readRDS(f)$Myeloid
+  # remove error
+  tmp <- tmp[!sapply(tmp, \(x) is(x, "try-error"))]
+  # find min row number
+  maxRow <- 500
+  # smooth the tp and fp
+  tmp <- lapply(tmp, \(x) {
+    if (nrow(x$modRF$TP) < maxRow) {
+      x$modRF$TP <- extendAuc(x$modRF$TP, nBin = maxRow)
+      x$modRF$FP <- extendAuc(x$modRF$FP, nBin = maxRow)
+    }
+    x
+  })
+
+  allResult[[featureDataSet]] <- tmp
+
+  aucResult <- rbind(
+    aucResult,
+    data.frame(
+      featureDataSet = featureDataSet,
+      AUC = sapply(tmp, \(x) x$modRF$AUC) %>% rowMeans(na.rm = TRUE) %>% `[`(2)
+    )
+  )
+}
+rownames(aucResult) <- NULL
+
+featureDataSetList <- c("chrs_all", "chrsPro_all", "chrs_nonChAndLowRisk", "chrsPro_nonChAndLowRisk", "chrs_medHighRisk", "chrsPro_medHighRisk")
+
+toPlot <- NULL
+for (featureDataSet in featureDataSetList) {
+  tp <- sapply(allResult[[featureDataSet]], \(x) x$modRF$TP[, 2])
+  tp <- ci(tp) %>% as.data.frame()
+  colnames(tp) <- paste0("tp_", colnames(tp))
+  fp <- sapply(allResult[[featureDataSet]], \(x) x$modRF$FP[, 2])
+  fp <- ci(fp) %>% as.data.frame()
+  colnames(fp) <- paste0("fp_", colnames(fp))
+  tmp <- cbind(tp, fp)
+  tmp$featureDataSet <- featureDataSet
+  tmp$dataSet <- str_split(featureDataSet, "_", simplify = TRUE)[1, 2]
+  toPlot <- rbind(toPlot, tmp)
+}
+labelText <- sapply(
+  featureDataSetList,
+  \(x) str_glue(
+    ifelse(grepl("Pro_", x), "CHRS + Proteomics", "CHRS"),
+    " (AUC=",
+    aucResult$AUC[match(x, aucResult$featureDataSet)] %>%
+      round(2),
+    ")"
+  )
+)
+toPlot$featureDataSet <- factor(toPlot$featureDataSet,
+  levels = featureDataSetList,
+  labels = labelText
+)
+dataSetN <- paste("chrs", c("all", "nonChAndLowRisk", "medHighRisk"), sep = "_")
+dataSetN <- sapply(allResult[dataSetN], \(x) {
+  tmp <- x[[1]]
+  sum(unlist((tmp[grepl("numC", names(tmp))])))
+})
+dataSetNCase <- paste("chrs", c("all", "nonChAndLowRisk", "medHighRisk"), sep = "_")
+dataSetNCase <- sapply(allResult[dataSetNCase], \(x) {
+  tmp <- x[[1]]
+  sum(unlist((tmp[grepl("numCase", names(tmp))])))
+})
+dataSetText <- paste0(
+  c("All participants", "Non-CH and low risk", "Medium and high risk"),
+  "\n(n=",
+  format(dataSetN, big.mark = ",") %>% str_squish(),
+  ", MN cases=",
+  format(dataSetNCase, big.mark = ",") %>% str_squish(),
+  ")"
+)
+toPlot$dataSet <- factor(toPlot$dataSet,
+  levels = c("all", "nonChAndLowRisk", "medHighRisk"),
+  labels = dataSetText
+)
+
+pList <- list()
+for (dataSet in unique(toPlot$dataSet)) {
+  p <- ggplot(
+    toPlot %>% dplyr::filter(dataSet == !!dataSet),
+    aes(
+      x = fp_mean, y = tp_mean, group = featureDataSet,
+      color = featureDataSet
+    )
+  ) +
+    theme_classic() +
+    scale_color_npg() +
+    geom_line() +
+    geom_ribbon(aes(
+      x = fp_mean, y = tp_mean,
+      group = featureDataSet, fill = featureDataSet,
+      ymin = tp_ciLow, ymax = tp_ciUp
+    ), alpha = 0.2, inherit.aes = FALSE) +
+    labs(
+      x = "1 - Specificity",
+      y = "Sentisivity",
+      color = "",
+      fill = "",
+      subtitle = dataSet
+    ) +
+    theme(legend.position = c(0.6, 0.2), plot.subtitle = element_text(size = 11))
+  pList[[dataSet]] <- p
+}
+
+png("Fig/aucChrs.png", width = 12, height = 4, units = "in", res = 300)
+
+cowplot::plot_grid(plotlist = pList, nrow = 1, rel_widths = c(1, 1, 1))
+
+dev.off()
+```
+
+# SNP score
+```{r}
+rSquare <- readRDS("Result/rSquareSnpScore.rds")
+allAssoc <- readRDS("Result/proChAssoc/proChAssoc_indel_or_cnv.rds")
+allAssoc <- data.frame(
+  type = "chAssoc",
+  assay = names(allAssoc),
+  pVal = sapply(allAssoc, function(x) x$pVal),
+  pFDR = p.adjust(sapply(allAssoc, function(x) x$pVal), method = "fdr"),
+  coef = sapply(allAssoc, \(x) x$coef[nrow(x$coef), 1])
+)
+
+allSigProteomics <- readRDS("Result/coxReg_clinical.rds")$Myeloid
+
+olinkFeatures <- names(allSigProteomics)
+allSigProteomics <- lapply(olinkFeatures, function(feature) {
+  data.frame(
+    assay = feature,
+    pVal = allSigProteomics[[feature]][["coef"]][feature, "Pr(>|z|)"],
+    coef = allSigProteomics[[feature]][["coef"]][feature, 1]
+  )
+}) %>%
+  do.call(what = rbind) %>%
+  mutate(pFDR = p.adjust(pVal, method = "fdr"))
+
+allSigProteomics <- allSigProteomics %>%
+  dplyr::mutate(
+    type = "myAssoc"
+  ) %>%
+  dplyr::select(type, assay, pFDR, coef) %>%
+  rbind(allAssoc %>% dplyr::select(type, assay, pFDR, coef)) %>%
+  group_by(assay) %>%
+  mutate(typeSig = paste(type[pFDR <= 0.05], collapse = "|")) %>%
+  ungroup() %>%
+  mutate(
+    typeSig = case_when(
+      typeSig == "myAssoc|chAssoc" ~ "Associated with myeloid and CH",
+      typeSig == "chAssoc" ~ "Associated with CH",
+      typeSig == "myAssoc" ~ "Associated with myeloid",
+      TRUE ~ "Not significant"
+    ),
+    typeSig = factor(typeSig, levels = c("Associated with myeloid and CH", "Associated with myeloid", "Associated with CH", "Not significant"))
+  ) %>%
+  dplyr::arrange(desc(as.numeric(typeSig))) %>%
+  dplyr::filter(type == "myAssoc" & typeSig != "Not significant") %>%
+  mutate(typeSig = typeSig %>% droplevels()) %>%
+  dplyr::select(-type) %>%
+  mutate(assay = toupper(assay))
+```
+
+```{r}
+allResult <- readRDS("Result/coxRegSnp_clinical.rds")$Myeloid
+
+event <- "Myeloid"
+tmp <- allResult
+olinkFeatures <- names(tmp)
+allResTable <- lapply(olinkFeatures, function(feature) {
+  data.frame(
+    assay = feature,
+    cancer = event,
+    pVal = tmp[[feature]][["coef"]][feature, "Pr(>|z|)"],
+    coef = tmp[[feature]][["coef"]][feature, "coef"],
+    numCase = tmp[[feature]][["numCase"]],
+    numControl = tmp[[feature]][["numControl"]]
+  )
+}) %>%
+  do.call(what = rbind) %>%
+  dplyr::select(assay, pVal, coef)
+
+allResult <- readRDS("Result/coxRegSnp_cliVafCnv.rds")$Myeloid
+
+tmp <- allResult
+olinkFeatures <- names(tmp)
+tmp <- lapply(olinkFeatures, function(feature) {
+  data.frame(
+    assay = feature,
+    cancer = event,
+    pVal = tmp[[feature]][["coef"]][feature, "Pr(>|z|)"],
+    coef = tmp[[feature]][["coef"]][feature, "coef"],
+    numCase = tmp[[feature]][["numCase"]],
+    numControl = tmp[[feature]][["numControl"]]
+  )
+}) %>%
+  do.call(what = rbind) %>%
+  dplyr::select(assay, pVal, coef) %>%
+  dplyr::rename(
+    pValChAdj = pVal,
+    coefChAdj = coef
+  )
+
+allResTable <- allResTable %>%
+  left_join(tmp, by = "assay") %>%
+  arrange(pVal) %>%
+  dplyr::filter(assay %in% allSigProteomics$assay) %>%
+  left_join(allSigProteomics %>%
+    rename(
+      pFDRProteomics = pFDR,
+      coefProteomics = coef,
+      typeSigProteomics = typeSig
+    ), by = "assay")
+
+allResTable <- allResTable %>%
+  left_join(rSquare, by = "assay") %>%
+  rename(rSquared = rSquare) %>%
+  dplyr::filter(rSquared >= 0.01)
+
+dirConsistentPro <- allResTable %>%
+  dplyr::filter(sign(coef) == sign(coefProteomics)) %>%
+  pull(assay)
+```
+
+## Forest plot (Figure 2A)
+```{r}
+allResult <- readRDS("Result/coxRegSnp_clinical.rds")$Myeloid
+
+event <- "Myeloid"
+tmp <- allResult
+olinkFeatures <- names(tmp)
+allResTable <- lapply(olinkFeatures, function(feature) {
+  data.frame(
+    assay = feature,
+    cancer = event,
+    pVal = tmp[[feature]][["coef"]][feature, "Pr(>|z|)"],
+    coef = tmp[[feature]][["coef"]][feature, "coef"],
+    se = tmp[[feature]][["coef"]][feature, "se(coef)"],
+    stringsAsFactors = FALSE
+  )
+}) %>%
+  do.call(what = rbind) %>%
+  dplyr::select(assay, pVal, coef, se) %>%
+  left_join(rSquare, by = "assay") %>%
+  rename(rSquared = rSquare) %>%
+  arrange(pVal) %>%
+  dplyr::filter(assay %in% allSigProteomics$assay[allSigProteomics$typeSig != "Associated with CH"] &
+    pVal < 0.05 &
+    rSquared >= 0.01) %>%
+  mutate(assay = factor(assay, levels = assay)) %>%
+  mutate(pVal = ifelse(pVal < 1e-2, scales::scientific(pVal, 1), round(pVal, 2)))
+
+allResTable <- allResTable %>%
+  mutate(
+    coefCiLow = coef - 1.96 * se,
+    coefCiHigh = coef + 1.96 * se
+  )
+
+allResTable <- allResTable %>%
+  dplyr::filter(assay %in% dirConsistentPro)
+
+logWithNeg <- scales::trans_new("logWithNeg",
+  transform = function(x) sign(x) * log(abs(x)),
+  inverse = function(x) sign(x) * exp(x)
+)
+
+p <- ggplot(data = allResTable, aes(y = assay, x = exp(coef), xmin = exp(coefCiLow), xmax = exp(coefCiHigh))) +
+  geom_point(size = 1.25, position = position_dodge2(width = 0.9, reverse = TRUE)) +
+  geom_errorbarh(height = .3, position = position_dodge2(padding = 0.4, reverse = TRUE)) +
+  labs(x = "Hazard ratio (95% CI)", y = "Protein") +
+  geom_vline(xintercept = 1, color = "black", linetype = "dashed", alpha = .5) +
+  theme_classic() +
+  scale_x_log10(breaks = c(0.5, 1, 1.5, 2)) +
+  scale_y_discrete(limits = rev) +
+  coord_cartesian(
+    xlim = c(0.2, 2.5),
+    ylim = c(0, nrow(allResTable)), expand = FALSE, clip = "off"
+  ) +
+  geom_text(
+    aes(x = 0.25, y = assay, label = pVal),
+    hjust = 0, inherit.aes = FALSE, show.legend = FALSE
+  ) +
+  geom_label(
+    data = data.frame(
+      x = 0.25,
+      y = nrow(allResTable) + 0.3,
+      label = c("p-value")
+    ), mapping = aes(x = x, y = y, label = label),
+    hjust = 0,
+    inherit.aes = FALSE, show.legend = FALSE
+  ) +
+  theme(plot.margin = unit(c(2, 0.5, 0.5, 0.5), "lines"))
+
+png("Fig/snpScore.png", width = 5, height = 4, units = "in", res = 300)
+p
+dev.off()
+```
+
+# Mendelian randomization
+```{r}
+mrGene <- fread("Result/mrGene_Myeloid.csv", data.table = FALSE)
+power <- fread("Result/proteomicsPower.csv", data.table = FALSE)
+mrGene <- mrGene %>%
+  left_join(power, by = c("target" = "assay"))
+```
+
+## Forest plot (Figure 2B)
+```{r}
+allMrResult <- readRDS("Result/MR/allMrResult_Myeloid.rds")
+
+names(allMrResult) <- sapply(allMrResult, \(x) x$mrRes$target)
+allMrResult <- lapply(allMrResult, \(x) if (x$mrRes$mrPvalue <= 0.05) x$fullMrRes else NULL)
+allMrResult <- allMrResult[!sapply(allMrResult, is.null)]
+allMrResult <- allMrResult[names(allMrResult) %in% mrGene$target]
+
+allMrResult <- lapply(names(allMrResult), \(target) {
+  res <- allMrResult[[target]]@Values
+  res$target <- target
+
+  res <- res %>% dplyr::filter(Method != "(intercept)")
+  res
+}) %>% do.call(what = rbind)
+colnames(allMrResult) <- c("Method", "coef", "se", "coefCiLow", "coefCiHigh", "pVal", "assay")
+
+allMrResult <- allMrResult %>%
+  mutate(pVal = ifelse(pVal < 1e-2, scales::scientific(pVal, 1), round(pVal, 2))) %>%
+  dplyr::filter(Method %in% c("Weighted median")) %>%
+  mutate(Method = factor(Method, levels = c("Weighted median"))) %>%
+  arrange(assay, Method)
+
+# only directionally consistent
+
+p <- ggplot(data = allMrResult, aes(
+  y = assay, x = coef,
+  xmin = coefCiLow, xmax = coefCiHigh, color = Method, group = Method
+)) +
+  geom_point(size = 1.25, position = position_dodge2(width = 0.9, reverse = FALSE)) +
+  geom_errorbarh(height = .1, position = position_dodge2(padding = 0.4, reverse = FALSE)) +
+  labs(x = "Coeficient", y = "Protein") +
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed", alpha = .5) +
+  theme_classic() +
+  ggsci::scale_color_npg() +
+  scale_y_discrete(limits = rev) +
+  coord_cartesian(
+    xlim = c(-2.25, 1.25),
+    ylim = c(0, length(unique(allMrResult$assay))) + 0.5, expand = FALSE, clip = "off"
+  ) +
+  geom_text(
+    aes(x = -2, y = assay, label = pVal),
+    hjust = 0, position = position_dodge2(width = 0.9, reverse = TRUE),
+    inherit.aes = FALSE, show.legend = FALSE
+  ) +
+  geom_label(
+    data = data.frame(
+      x = -2,
+      y = length(unique(allMrResult$assay)) + 0.6,
+      label = c("p-value")
+    ), mapping = aes(x = x, y = y, label = label),
+    hjust = 0,
+    inherit.aes = FALSE, show.legend = FALSE
+  ) +
+  theme(plot.margin = unit(c(2, 0.5, 0.5, 0.5), "lines")) +
+  guides(color = guide_legend(reverse = TRUE))
+
+png("Fig/mr_wm.png", width = 5, height = 4, units = "in", res = 300)
+p
+dev.off()
+```
+
+## Forest plot all (Supplementary Figure 10)
+```{r}
+allMrResult <- readRDS("Result/MR/allMrResult_Myeloid.rds")
+
+names(allMrResult) <- sapply(allMrResult, \(x) x$mrRes$target)
+allMrResult <- lapply(allMrResult, \(x) if (x$mrRes$mrPvalue <= 0.05) x$fullMrRes else NULL)
+allMrResult <- allMrResult[!sapply(allMrResult, is.null)]
+allMrResult <- allMrResult[names(allMrResult) %in% mrGene$target]
+
+allMrResult <- lapply(names(allMrResult), \(target) {
+  res <- allMrResult[[target]]@Values
+  res$target <- target
+
+  res <- res %>% dplyr::filter(Method != "(intercept)")
+  res
+}) %>% do.call(what = rbind)
+colnames(allMrResult) <- c("Method", "coef", "se", "coefCiLow", "coefCiHigh", "pVal", "assay")
+
+allMrResult <- allMrResult %>%
+  mutate(pVal = ifelse(pVal < 1e-2, scales::scientific(pVal, 1), round(pVal, 2))) %>%
+  dplyr::filter(Method %in% c("IVW", "Robust IVW", "Weighted median", "MR-Egger", "Robust MR-Egger")) %>%
+  mutate(Method = factor(Method, levels = c("IVW", "Robust IVW", "Weighted median", "MR-Egger", "Robust MR-Egger"))) %>%
+  arrange(assay, Method)
+
+# only directionally consistent
+allMrResult <- allMrResult
+
+png("Fig/mr.png", width = 6, height = 4, units = "in", res = 300)
+
+p <- ggplot(data = allMrResult, aes(
+  y = assay, x = coef,
+  xmin = coefCiLow, xmax = coefCiHigh, color = Method, group = Method
+)) +
+  geom_point(size = 1.25, position = position_dodge2(width = 0.9, reverse = FALSE)) +
+  geom_errorbarh(height = .9, position = position_dodge2(padding = 0.65, reverse = FALSE)) +
+  labs(x = "Coeficient", y = "Protein") +
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed", alpha = .5) +
+  theme_classic() +
+  ggsci::scale_color_npg() +
+  scale_y_discrete(limits = rev) +
+  coord_cartesian(
+    xlim = c(-2.25, 1.25),
+    ylim = c(0, length(unique(allMrResult$assay))) + 0.5, expand = FALSE, clip = "off"
+  ) +
+  geom_text(
+    aes(x = -2, y = assay, label = pVal),
+    hjust = 0, position = position_dodge2(width = 0.9, reverse = TRUE),
+    inherit.aes = FALSE, show.legend = FALSE
+  ) +
+  geom_label(
+    data = data.frame(
+      x = -2,
+      y = length(unique(allMrResult$assay)) + 0.6,
+      label = c("p-value")
+    ), mapping = aes(x = x, y = y, label = label),
+    hjust = 0,
+    inherit.aes = FALSE, show.legend = FALSE
+  ) +
+  theme(plot.margin = unit(c(2, 0.5, 0.5, 0.5), "lines")) +
+  guides(color = guide_legend(reverse = TRUE))
+p
+
+dev.off()
+```
+
+```{r}
+allMrResult <- readRDS("Result/MR/allMrResult_Myeloid.rds")
+
+names(allMrResult) <- sapply(allMrResult, \(x) x$mrRes$target)
+allMrResult <- lapply(allMrResult, \(x) if (x$mrRes$mrPvalue <= 0.05) x else NULL)
+allMrResult <- allMrResult[!sapply(allMrResult, is.null)]
+allMrResult <- allMrResult[names(allMrResult) %in% mrGene$target]
+
+pdf("Fig/mrGene.pdf", width = 6, height = 4)
+
+sqrtWithNeg <- scales::trans_new("sqrtWithNeg",
+  transform = function(x) sign(x) * sqrt(abs(x)),
+  inverse = function(x) sign(x) * abs(x)**2
+)
+
+target <- names(allMrResult)[1]
+for (target in names(allMrResult)) {
+  tmp <- allMrResult[[target]]$fullMrRes@Values
+  regLineBeta <- list()
+  for (method in c("IVW", "Robust IVW", "Weighted median", "MR-Egger", "Robust MR-Egger")) {
+    if (grepl("Egger", method)) {
+      regLineBeta[[method]] <- data.frame(
+        method = method,
+        beta = tmp[which(tmp$Method == method), "Estimate"],
+        intercept = tmp[which(tmp$Method == method) + 1, "Estimate"],
+        stringsAsFactors = FALSE
+      )
+    } else {
+      regLineBeta[[method]] <- data.frame(
+        method = method,
+        beta = tmp[which(tmp$Method == method), "Estimate"],
+        intercept = 0,
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+  regLineBeta <- do.call(what = rbind, regLineBeta)
+  regLineBeta$method <- factor(regLineBeta$method, levels = c("IVW", "Robust IVW", "Weighted median", "MR-Egger", "Robust MR-Egger"))
+  res <- allMrResult[[target]]$mrInput
+  res <- data.frame(
+    beta = res@betaX,
+    se = res@betaXse,
+    myBeta = res@betaY,
+    mySe = res@betaYse
+  )
+
+  p <- ggplot(data = res, aes(
+    x = beta, y = myBeta
+  )) +
+    theme_classic() +
+    geom_vline(xintercept = 0, color = "black", linetype = "dashed", alpha = .5) +
+    geom_hline(yintercept = 0, color = "black", linetype = "dashed", alpha = .5) +
+    geom_point(size = 1.25) +
+    geom_errorbarh(aes(xmin = beta - 1.96 * se, xmax = beta + 1.96 * se),
+      height = 0, alpha = 0.2
+    ) +
+    geom_errorbar(aes(ymin = myBeta - 1.96 * mySe, ymax = myBeta + 1.96 * mySe), width = 0, alpha = 0.1) +
+    labs(
+      x = str_glue("Genetic association with {target}"),
+      y = str_glue("Genetic association with Myeloid"),
+      color = "MR method"
+    ) +
+    coord_cartesian(
+      xlim = c(min(res$beta), max(res$beta)),
+      ylim = c(min(res$myBeta), max(res$myBeta))
+    ) +
+    geom_abline(
+      data = regLineBeta,
+      aes(slope = beta, intercept = intercept, color = method)
+    ) +
+    ggsci::scale_color_npg()
+
+  plot(p)
+}
+
+dev.off()
+```
+
+# Blood count volcano plot (Supplementary Figure 6)
+```{r}
+event <- "Myeloid"
+
+{
+  allAssoc <- readRDS("Result/proChAssoc/proChAssoc_indel_or_cnv.rds")
+  allAssoc <- data.frame(
+    type = "chAssoc",
+    assay = names(allAssoc),
+    pVal = sapply(allAssoc, function(x) x$pVal),
+    pFDR = p.adjust(sapply(allAssoc, function(x) x$pVal), method = "fdr"),
+    coef = sapply(allAssoc, \(x) x$coef[nrow(x$coef), 1])
+  )
+
+  allSigProteomics <- readRDS("Result/coxReg_clinical.rds")
+  allSigProteomics <- allSigProteomics$Myeloid
+
+  olinkFeatures <- names(allSigProteomics)
+  allSigProteomics <- lapply(olinkFeatures, function(feature) {
+    data.frame(
+      assay = feature,
+      pVal = allSigProteomics[[feature]][["coef"]][feature, "Pr(>|z|)"],
+      coef = allSigProteomics[[feature]][["coef"]][feature, 1]
+    )
+  }) %>%
+    do.call(what = rbind) %>%
+    mutate(pFDR = p.adjust(pVal, method = "fdr"))
+
+  allLevels <- c(str_glue("Associated with {tolower(event)} and CH"), str_glue("Associated with {tolower(event)}"), "Associated with CH", "Not significant")
+  allSigProteomics <- allSigProteomics %>%
+    dplyr::mutate(
+      type = "myAssoc"
+    ) %>%
+    dplyr::select(type, assay, pFDR, coef) %>%
+    rbind(allAssoc %>% dplyr::select(type, assay, pFDR, coef)) %>%
+    group_by(assay) %>%
+    mutate(typeSig = paste(type[pFDR <= 0.05], collapse = "|")) %>%
+    ungroup() %>%
+    mutate(
+      typeSig = case_when(
+        typeSig == "myAssoc|chAssoc" ~ allLevels[1],
+        typeSig == "chAssoc" ~ allLevels[3],
+        typeSig == "myAssoc" ~ allLevels[2],
+        TRUE ~ allLevels[4]
+      ),
+      typeSig = factor(typeSig, levels = allLevels)
+    ) %>%
+    dplyr::arrange(desc(as.numeric(typeSig))) %>%
+    dplyr::filter(type == "myAssoc" & typeSig != "Not significant") %>%
+    mutate(typeSig = typeSig %>% droplevels()) %>%
+    dplyr::select(-type) %>%
+    mutate(assay = toupper(assay))
+}
+
+allResult <- readRDS(str_glue("Result/proBcAssoc.rds"))
+bloodCountFeatures <- c("platelet_count", "lymphocyte_count", "haemoglobin_concentration")
+
+allResTable <- NULL
+for (bc in bloodCountFeatures) {
+  tmp <- allResult[[bc]]
+  olinkFeatures <- names(tmp)
+  tmpRes <- lapply(olinkFeatures, \(x)
+  data.frame(
+    assay = x %>% toupper(),
+    pVal = tmp[[x]][["coef"]][bc, "Pr(>|t|)"],
+    coef = tmp[[x]][["coef"]][bc, "Estimate"],
+    bloodCount = bc,
+    stringsAsFactors = FALSE
+  )) %>%
+    do.call(what = rbind) %>%
+    dplyr::filter(assay %in% allSigProteomics$assay)
+  allResTable <- rbind(allResTable, tmpRes)
+}
+
+allResTable <- allResTable %>%
+  group_by(assay) %>%
+  mutate(pFDR = p.adjust(pVal, method = "fdr")) %>%
+  ungroup()
+
+allResTable <- allResTable %>%
+  left_join(
+    allSigProteomics %>% dplyr::select(assay, typeSig),
+    by = "assay"
+  )
+allResTable <- allResTable %>%
+  mutate(
+    bloodCount = case_when(
+      bloodCount == "platelet_count" ~ "Platelet count",
+      bloodCount == "lymphocyte_count" ~ "Lymphocyte count",
+      bloodCount == "haemoglobin_concentration" ~ "Hemoglobin concentration",
+      TRUE ~ bloodCount
+    )
+  )
+
+pdf("Fig/volcano_bc.pdf", width = 5, height = 4)
+
+for (bc in unique(allResTable$bloodCount)) {
+  toPlotInd <- allResTable %>%
+    dplyr::filter(bloodCount == !!bc) %>%
+    mutate(minusLogP = -log10(pFDR)) %>%
+    mutate(minusLogP = ifelse(is.infinite(minusLogP), max(minusLogP[!is.infinite(minusLogP)]) + 1, minusLogP)) %>%
+    mutate(minusLogP = abs(minusLogP)) %>%
+    mutate(
+      typeSig = case_when(
+        typeSig == "Associated with myeloid and CH" ~ "MN & CH",
+        typeSig == "Associated with myeloid" ~ "CH only",
+        typeSig == "Associated with CH" ~ "MN only",
+        TRUE ~ "Not significant"
+      ),
+      typeSig = factor(typeSig, levels = c("MN & CH", "MN only", "CH only", "Not significant"))
+    ) %>%
+    dplyr::arrange(desc(as.numeric(typeSig)))
+
+  sqrtWithNeg <- scales::trans_new("sqrtWithNeg",
+    transform = function(x) sign(x) * abs(x)**(3 / 2),
+    inverse = function(x) sign(x) * abs(x)**(2 / 3)
+  )
+
+  toShow <- toPlotInd %>%
+    arrange(desc(minusLogP)) %>%
+    dplyr::filter(minusLogP >= 150) %>%
+    # head(20) %>%
+    pull(assay)
+  marker <- c("FGF2", "EGF", "THPO", "PDGFB", "PDGFA")
+  marker <- intersect(marker, toShow)
+  toShow <- c(marker, setdiff(toShow, marker)[1:(10 - length(marker))])
+
+  p <- ggplot(
+    toPlotInd,
+    aes(y = minusLogP, x = coef, color = typeSig)
+  ) +
+    geom_point(shape = 19, alpha = 0.8) +
+    theme_classic() +
+    scale_color_manual(values = c("#BC3C29FF", "#0072B5FF", "#20854EFF", "grey")) +
+    scale_x_continuous(limits = c(
+      -max(abs(toPlotInd$coef)),
+      max(abs(toPlotInd$coef)) + 0.12
+    )) +
+    scale_y_continuous(trans = sqrtWithNeg) +
+    geom_label_repel(
+      data = toPlotInd %>%
+        dplyr::filter(
+          assay %in% toShow
+        ),
+      mapping = aes(y = minusLogP, x = coef, label = assay),
+      max.overlaps = 30,
+      min.segment.length = 1,
+      max.time = 1,
+      nudge_y = -50,
+      show.legend = FALSE
+    ) +
+    labs(x = "Coefficient", y = expression(-log[10] ~ pFDR), color = "Association type", subtitle = bc) +
+    geom_vline(xintercept = 0, color = "black", linetype = "dashed", alpha = .5) +
+    theme(
+      legend.position = c(0.85, 0.2)
+    )
+
+  plot(p)
+}
+
+dev.off()
+```
+
+# IL heatmap (Supplementary Figure 5)
+```{r}
+proteinToPlot <- c("il6", "il1b", "il18")
+chFeatures <- c("indel_chPD", "indel_DNMT3A", "indel_TET2", "indel_ASXL1", "indel_PPM1D", "indel_JAK2", "indel_SF3B1", "indel_SRSF2", "indel_TP53")
+
+allAssocTable <- NULL
+for (chFeature in chFeatures) {
+  for (bcAdjust in c("Yes", "No"))
+  {
+    if (bcAdjust == "Yes") {
+      allAssoc <- readRDS(str_glue("Result/proChAssoc/proChAssoc_{chFeature}.rds"))
+    } else {
+      allAssoc <- readRDS(str_glue("Result/proChAssocNoBc/proChAssocNoBc_{chFeature}.rds"))
+    }
+    allAssocTable <- rbind(
+      allAssocTable,
+      data.frame(
+        chFeature = chFeature,
+        bcAdjust = bcAdjust,
+        assay = names(allAssoc) %>% toupper(),
+        pVal = sapply(allAssoc, function(x) x$pVal),
+        pFDR = p.adjust(sapply(allAssoc, function(x) x$pVal), method = "fdr"),
+        coef = sapply(allAssoc, function(x) x$coef[nrow(x$coef), 1])
+      )
+    )
+  }
+}
+allAssocTable <- allAssocTable %>%
+  dplyr::filter(grepl("IL6|IL1B|IL18", assay)) %>%
+  dplyr::filter(assay %in% c("IL6", "IL6R", "IL18", "IL1B")) %>%
+  mutate(chFeature = case_when(
+    chFeature == "indel_chPD" ~ "All CH",
+    TRUE ~ str_split(chFeature, "_", simplify = TRUE)[, 2]
+  )) %>%
+  mutate(
+    chFeature = factor(chFeature, levels = unique(chFeature)),
+    assay = factor(assay, levels = unique(assay) %>% sort() %>% rev())
+  ) %>%
+  mutate(
+    pValDir = case_when(
+      coef > 0 & pVal <= 0.00025 ~ "+ p <= 0.00025",
+      coef > 0 & pVal <= 0.05 ~ "+ p <= 0.05",
+      coef <= 0 & pVal <= 0.00025 ~ "- p <= 0.00025",
+      coef <= 0 & pVal <= 0.05 ~ "- p <= 0.05",
+      coef > 0 ~ "+ p > 0.05",
+      coef <= 0 ~ "- p > 0.05",
+      TRUE ~ "Not significant"
+    ),
+    pValDir = factor(pValDir, levels = c("+ p <= 0.00025", "+ p <= 0.05", "+ p > 0.05", "Not significant", "- p > 0.05", "- p <= 0.05", "- p <= 0.00025"))
+  )
+
+fillColor <- c(
+  "+ p <= 0.00025" = "darkred",
+  "+ p <= 0.05" = "#ad2626",
+  "+ p > 0.05" = "#f19494",
+  "Not significant" = "white",
+  "- p > 0.05" = "#8faadd",
+  "- p <= 0.05" = "#2c5196",
+  "- p <= 0.00025" = "darkblue"
+)
+plotList <- list()
+for (bcAdjust in c("Yes", "No")) {
+  heatmap <- ggplot(
+    allAssocTable %>% dplyr::filter(bcAdjust == !!bcAdjust),
+    aes(x = chFeature, y = assay, fill = pValDir)
+  ) +
+    geom_tile(color = "lightgrey") +
+    scale_fill_manual(values = fillColor) +
+    labs(x = NULL, y = NULL, fill = "p-value") +
+    theme_classic()
+  if (bcAdjust == "Yes") {
+    heatmap <- heatmap + labs(title = "With blood count correction")
+  } else {
+    heatmap <- heatmap + labs(title = "Without blood count correction")
+  }
+
+  plotList[[bcAdjust]] <- heatmap
+}
+
+png("Fig/ilHeatmap.png", width = 8, height = 6, units = "in", res = 300)
+cowplot::plot_grid(plotlist = plotList, nrow = 2)
+dev.off()
+```
+
